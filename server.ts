@@ -1,5 +1,4 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import cors from "cors";
@@ -17,13 +16,16 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Vite middleware for development
+// Conditionally import and use Vite only in development
 if (process.env.NODE_ENV !== "production") {
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: "spa",
+  import("vite").then(({ createServer: createViteServer }) => {
+    createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    }).then(vite => {
+      app.use(vite.middlewares);
+    });
   });
-  app.use(vite.middlewares);
 } else {
   const distPath = path.join(__dirname, "dist");
   app.use(express.static(distPath));
