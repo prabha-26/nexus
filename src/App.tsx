@@ -1,5 +1,16 @@
 import React, { useState, useEffect, FormEvent, useRef, ReactNode, ErrorInfo } from "react";
-import { supabase, handleSupabaseError, OperationType, testSupabaseConnection } from "./lib/supabase";
+import {
+  supabase,
+  handleSupabaseError,
+  OperationType,
+  testSupabaseConnection,
+  getUserAvatar,
+  getUserDisplayName,
+  isSupabaseConfigured,
+  supabaseConfigMessage,
+  normalizePost,
+  type FeedPost,
+} from "./lib/supabase";
 import { User } from "@supabase/supabase-js";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
@@ -31,8 +42,13 @@ import {
 import { motion, AnimatePresence, useScroll, useSpring, useMotionValue } from "motion/react";
 import { ThemeProvider, useTheme } from "next-themes";
 
-class ErrorBoundary extends (React.Component as any) {
-  constructor(props: any) {
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends React.Component<{ children: ReactNode }, ErrorBoundaryState> {
+  constructor(props: { children: ReactNode }) {
     super(props);
     this.state = { hasError: false, error: null };
   }
@@ -51,7 +67,7 @@ class ErrorBoundary extends (React.Component as any) {
       let errorMessage = "An unexpected error occurred.";
       try {
         const parsed = JSON.parse(error?.message || "");
-        if (parsed.error) errorMessage = `Firestore Error: ${parsed.error}`;
+        if (parsed.error) errorMessage = `Supabase Error: ${parsed.error}`;
       } catch (e) {
         errorMessage = error?.message || errorMessage;
       }
@@ -212,10 +228,10 @@ export default function App() {
 function AppContent() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [posts, setPosts] = useState<any[]>([]);
+  const [posts, setPosts] = useState<FeedPost[]>([]);
   const [newPost, setNewPost] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [dbStatus, setDbStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [dbStatus, setDbStatus] = useState<"checking" | "online" | "offline" | "config">("checking");
   
   // Auth Form State
   const [isRegistering, setIsRegistering] = useState(false);
@@ -234,40 +250,57 @@ function AppContent() {
 
   useEffect(() => {
     const checkConn = async () => {
+      if (!isSupabaseConfigured) {
+        setDbStatus("config");
+        return;
+      }
+
       const isOnline = await testSupabaseConnection();
-      setDbStatus(isOnline ? 'online' : 'offline');
+      setDbStatus(isOnline ? "online" : "offline");
     };
     checkConn();
   }, []);
 
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-      const user = session?.user || null;
-      if (user) {
-        try {
-          const { data: existingUser } = await supabase
-            .from('users')
-            .select('uid')
-            .eq('uid', user.id)
-            .single();
+    if (!supabase) {
+      setLoading(false);
+      setUser(null);
+      setPosts([]);
+      return;
+    }
 
-          if (!existingUser) {
-            await supabase.from('users').insert({
-              uid: user.id,
-              email: user.email,
-              display_name: user.user_metadata?.full_name || user.email?.split('@')[0],
-              photo_url: user.user_metadata?.avatar_url || "",
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event: string, session: { user: User | null } | null) => {
+      const sessionUser = session?.user || null;
+
+      if (sessionUser) {
+        try {
+          const { error } = await supabase.from("users").upsert(
+            {
+              uid: sessionUser.id,
+              email: sessionUser.email ?? null,
+              display_name: getUserDisplayName(sessionUser),
+              photo_url: getUserAvatar(sessionUser),
               role: "user",
-              created_at: new Date().toISOString()
-            });
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: "uid" },
+          );
+
+          if (error) {
+            throw error;
           }
         } catch (error) {
-          handleSupabaseError(error, OperationType.GET, 'users');
+          const appError = handleSupabaseError(error, OperationType.WRITE, "users", { rethrow: false });
+          toast.error(appError.message || "PROFILE_SYNC_FAILED");
+          setDbStatus("offline");
         }
-        setUser(user);
+
+        setUser(sessionUser);
       } else {
         setUser(null);
+        setPosts([]);
       }
+
       setLoading(false);
     });
 
@@ -275,9 +308,9 @@ function AppContent() {
   }, []);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user || !supabase) return;
 
-    const channel = supabase
+    const channel: any = supabase
       .channel('posts_changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'posts' }, (payload) => {
         // Refetch posts on any change
@@ -288,15 +321,18 @@ function AppContent() {
     const fetchPosts = async () => {
       try {
         const { data, error } = await supabase
-          .from('posts')
-          .select('*')
-          .order('created_at', { ascending: false })
+          .from("posts")
+          .select("*")
+          .order("created_at", { ascending: false })
           .limit(50);
 
         if (error) throw error;
-        setPosts(data || []);
+        setPosts((data || []).map((post: any) => normalizePost(post)));
       } catch (error) {
-        handleSupabaseError(error, OperationType.LIST, 'posts');
+        const appError = handleSupabaseError(error, OperationType.LIST, "posts", { rethrow: false });
+        setPosts([]);
+        setDbStatus("offline");
+        toast.error(appError.message || "POSTS_UNAVAILABLE");
       }
     };
 
@@ -307,23 +343,15 @@ function AppContent() {
     };
   }, [user]);
 
-  const handleGoogleLogin = async () => {
-    try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: window.location.origin
-        }
-      });
-      if (error) throw error;
-      toast.success("ACCESS GRANTED");
-    } catch (error) {
-      toast.error("AUTH_FAILURE");
-    }
-  };
+
 
   const handleEmailAuth = async (e: FormEvent) => {
     e.preventDefault();
+    if (!supabase) {
+      toast.error(supabaseConfigMessage);
+      return;
+    }
+
     if (!email || !password) return;
     if (isRegistering && !displayName) {
       toast.error("NAME_REQUIRED");
@@ -360,6 +388,11 @@ function AppContent() {
   };
 
   const handleLogout = async () => {
+    if (!supabase) {
+      toast.error(supabaseConfigMessage);
+      return;
+    }
+
     try {
       const { error } = await supabase.auth.signOut();
       if (error) throw error;
@@ -371,13 +404,19 @@ function AppContent() {
 
   const handleCreatePost = async (e: FormEvent) => {
     e.preventDefault();
+    if (!supabase) {
+      toast.error(supabaseConfigMessage);
+      return;
+    }
+
     if (!newPost.trim() || !user) return;
 
     setIsSubmitting(true);
     try {
       const { error } = await supabase.from('posts').insert({
         author_uid: user.id,
-        author_name: user.user_metadata?.full_name || user.email?.split('@')[0] || "Anonymous",
+        author_name: getUserDisplayName(user),
+        author_photo: getUserAvatar(user),
         content: newPost,
         created_at: new Date().toISOString()
       });
@@ -385,7 +424,8 @@ function AppContent() {
       setNewPost("");
       toast.success("DATA_PUBLISHED");
     } catch (error) {
-      handleSupabaseError(error, OperationType.CREATE, "posts");
+      const appError = handleSupabaseError(error, OperationType.CREATE, "posts", { rethrow: false });
+      toast.error(appError.message || "POST_CREATE_FAILED");
     } finally {
       setIsSubmitting(false);
     }
@@ -434,7 +474,7 @@ function AppContent() {
             <ThemeToggle />
             {user ? (
               <div className="flex items-center gap-6">
-                <span className="hidden md:inline text-muted-foreground">{user.displayName || "USER"}</span>
+                <span className="hidden md:inline text-muted-foreground">{getUserDisplayName(user).toUpperCase()}</span>
                 <button onClick={handleLogout} className="hover:text-foreground transition-colors">Terminate</button>
               </div>
             ) : (
@@ -626,21 +666,18 @@ function AppContent() {
                           <Button 
                             type="submit" 
                             className="w-full h-14 bg-foreground text-background hover:bg-foreground/90 rounded-none font-mono font-bold uppercase tracking-widest"
-                            disabled={authLoading}
+                            disabled={authLoading || !isSupabaseConfigured}
                           >
                             {authLoading ? "Processing..." : (isRegistering ? "Register_Node" : "Establish_Link")}
                           </Button>
-                          
-                          <Button 
-                            type="button"
-                            variant="outline" 
-                            className="w-full h-14 border-border rounded-none font-mono font-bold uppercase tracking-widest hover:bg-accent"
-                            onClick={handleGoogleLogin}
-                          >
-                            Google_Auth
-                          </Button>
                         </div>
                       </form>
+
+                      {!isSupabaseConfigured && (
+                        <p className="mt-6 font-mono text-[10px] leading-relaxed text-muted-foreground">
+                          {supabaseConfigMessage}
+                        </p>
+                      )}
                       
                       <div className="mt-8 pt-8 border-t border-border flex justify-center">
                         <button 
@@ -718,16 +755,16 @@ function AppContent() {
                             <div className="flex items-center justify-between mb-6">
                               <div className="flex items-center gap-4">
                                 <div className="w-10 h-10 bg-muted border border-border flex items-center justify-center">
-                                  {post.authorPhoto ? (
-                                    <img src={post.authorPhoto} alt="" className="w-full h-full object-cover grayscale opacity-50 hover:grayscale-0 hover:opacity-100 transition-all" referrerPolicy="no-referrer" />
+                                  {post.author_photo ? (
+                                    <img src={post.author_photo} alt="" className="w-full h-full object-cover grayscale opacity-50 hover:grayscale-0 hover:opacity-100 transition-all" referrerPolicy="no-referrer" />
                                   ) : (
                                     <UserIcon className="w-5 h-5 text-muted-foreground" />
                                   )}
                                 </div>
                                 <div>
-                                  <p className="text-sm font-mono font-bold uppercase tracking-wider">{post.authorName}</p>
+                                  <p className="text-sm font-mono font-bold uppercase tracking-wider">{post.author_name}</p>
                                   <p className="mono-label !text-[8px]">
-                                    {new Date(post.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                                    {new Date(post.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                                   </p>
                                 </div>
                               </div>
@@ -762,10 +799,15 @@ function AppContent() {
                     <div className="space-y-6">
                       <div className="flex items-center justify-between">
                         <span className="mono-label !text-muted-foreground">Database</span>
-                        <span className={`font-mono text-xs ${dbStatus === 'online' ? 'text-green-500' : dbStatus === 'offline' ? 'text-destructive' : 'text-muted-foreground'}`}>
+                        <span className={`font-mono text-xs ${dbStatus === 'online' ? 'text-green-500' : dbStatus === 'config' ? 'text-amber-500' : dbStatus === 'offline' ? 'text-destructive' : 'text-muted-foreground'}`}>
                           {dbStatus.toUpperCase()}
                         </span>
                       </div>
+                      {dbStatus === "config" && (
+                        <p className="font-mono text-[10px] leading-relaxed text-muted-foreground">
+                          Configure <span className="text-foreground">VITE_SUPABASE_URL</span> and <span className="text-foreground">VITE_SUPABASE_PUBLISHABLE_KEY</span> to connect the app to your Supabase cloud database.
+                        </p>
+                      )}
                       <div className="flex items-center justify-between">
                         <span className="mono-label !text-muted-foreground">Uptime</span>
                         <span className="font-mono text-xs">99.99%</span>
